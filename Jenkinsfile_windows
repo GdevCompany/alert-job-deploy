@@ -1,0 +1,93 @@
+#!groovy
+pipeline {
+    agent any
+    //java should be 25
+    tools {
+        jdk 'jdk_25'
+    }
+    environment {
+        REVISION = "1.0.${BUILD_ID}"
+        APP_CONFIG_FILENAME = "alert-job-gateway/src/main/resources/static/index.html"
+        REGISTRY = 'rg.gdev.by/alert-job'
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                bat 'git log -1 --oneline'
+                script {
+                    config = readFile "${APP_CONFIG_FILENAME}"
+                    newconfig = config.replaceAll('build_version', "${REVISION}")
+                    writeFile file: "${APP_CONFIG_FILENAME}", text: "${newconfig}"
+                }
+            }
+        }
+        stage('Build') {
+            parallel {
+                stage('Front image') {
+                    steps {
+                        bat "cd front && docker build --build-arg REVISION=${REVISION} -t ${REGISTRY}/front:${REVISION} ."
+                    }
+                }
+                stage('Maven modules') {
+                    steps {
+                        bat "mvn -Drevision=${REVISION} -Ddocker.skip=true -T 1C clean install -DskipTests"
+                    }
+                }
+            }
+        }
+        stage('Push images to docker repo') {
+            steps {
+                withCredentials(bindings: [usernamePassword(credentialsId: 'registryuser', usernameVariable: 'usernameVariable', passwordVariable: 'passwordVariable')]) {
+                    script {
+                        bat 'docker login rg.gdev.by -u %usernameVariable% -p %passwordVariable%'
+
+                        def buildAndPush = { String moduleDir, String imageName, String jarFile, String port, String dockerfile ->
+                            bat """
+                                cd ${moduleDir}
+                                docker build -f target/docker/${dockerfile} -t ${REGISTRY}/${imageName}:${REVISION} --build-arg JAR_FILE=${jarFile} --build-arg SERVER_PORT=${port} .
+                                docker push ${REGISTRY}/${imageName}:${REVISION}
+                            """
+                        }
+
+                        parallel(
+                            'config': {
+                                buildAndPush('alert-job-config', 'alert-job-config', "alert-job-config-${REVISION}.jar", '8011', 'java-service.Dockerfile')
+                            },
+                            'gateway': {
+                                buildAndPush('alert-job-gateway', 'alert-job-gateway', "alert-job-gateway-${REVISION}.jar", '8015', 'java-service.Dockerfile')
+                            },
+                            'core': {
+                                buildAndPush('core-alert-job', 'core-alert-job', "core-alert-job-${REVISION}.jar", '8018', 'java-service.Dockerfile')
+                            },
+                            'notification': {
+                                buildAndPush('notification-alert-job', 'notification-alert-job', "notification-alert-job-${REVISION}.jar", '8019', 'java-playwright.Dockerfile')
+                            },
+                            'parser': {
+                                buildAndPush('parser-alert-job', 'parser-alert-job', "parser-alert-job-${REVISION}.jar", '8017', 'java-playwright.Dockerfile')
+                            },
+                            'llm': {
+                                buildAndPush('llm-alert-job', 'llm-alert-job', "llm-alert-job-${REVISION}.jar", '8033', 'java-service.Dockerfile')
+                            },
+                            'front': {
+                                bat "docker push ${REGISTRY}/front:${REVISION}"
+                            },
+                            'camoufox-launcher': {
+                                bat """
+                                    docker build -f docker/camoufox-launcher.Dockerfile -t ${REGISTRY}/camoufox-launcher:${REVISION} --build-arg PLAYWRIGHT_VERSION=1.62.0 .
+                                    docker push ${REGISTRY}/camoufox-launcher:${REVISION}
+                                """
+                            }
+                        )
+                    }
+                }
+            }
+        }
+        stage('replace and restart') {
+            steps {
+                bat "ssh server \"sed -i 's/alert_job_version=.*/alert_job_version=${REVISION}/' /home/app/service/aj/.env\""
+                bat 'ssh server "cd /home/app/service/aj && /home/app/service/aj/now_up.sh"'
+            }
+        }
+    }
+}

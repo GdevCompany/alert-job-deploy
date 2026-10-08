@@ -1,0 +1,192 @@
+services:
+  keycloak:
+    image: alert-job/alert-job-keycloak:0.1
+    build:
+      context: ./keycloak
+      dockerfile: Dockerfile
+    #restart: always
+    command:
+      - "start-dev"
+      - "--hostname-url=http://alertjob.by/keycloak"
+      - "--hostname-admin-url=http://alertjob.by/keycloak"
+      - "--proxy=edge"
+      #- health-enabled=true
+      #- metrics-enabled=true
+    ports:
+      - "8080:8080"
+    environment:
+      VIRTUAL_HOST: alertjob.by
+      VIRTUAL_PORT: 8080
+      VIRTUAL_PATH: /keycloak
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/ready || curl -fsS http://localhost:8080/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+  nginx-proxy:
+    container_name: nginx-proxy
+    image: nginxproxy/nginx-proxy
+    hostname: alertjob.by
+    ports:
+#      - "443:443"
+      - "80:80"
+    volumes:
+#      - html:/usr/share/nginx/html
+      - ../alert-job-base/config/vhost-nginx-dev:/etc/nginx/vhost.d
+#      - certs:/etc/nginx/certs:ro
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ../alert-job-base/config/nginx-conf-d:/etc/nginx/conf.d
+    environment:
+      TZ: Europe/Moscow
+  config:
+    image: rg.gdev.by/alert-job/alert-job-config:1.0
+    ports:
+      - "8011:8011"
+    volumes:
+      - ../alert-job-config-repo:/alert-job-config-repo:ro
+    environment:
+      - SPRING_PROFILES_ACTIVE=dev,native
+      - SPRING_CLOUD_CONFIG_SERVER_NATIVE_SEARCH_LOCATIONS=file:///alert-job-config-repo
+      - TZ=Europe/Moscow
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8011/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+  #set directory rules chmod 777 public
+  gateway:
+    image: rg.gdev.by/alert-job/alert-job-gateway:1.0
+    ports:
+      - "8015:8015"
+    environment:
+      SPRING_PROFILES_ACTIVE: $profile
+      TZ: Europe/Moscow
+      VIRTUAL_HOST: alertjob.by
+      VIRTUAL_PORT: 8015
+      VIRTUAL_PATH: /
+    #extra_hosts:
+     #   - "aj.by:nginx-alert-job" #host and ip
+    depends_on:
+      config:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+  camoufox-launcher:
+    image: rg.gdev.by/alert-job/camoufox-launcher:$alert_job_version
+    build:
+      context: .
+      dockerfile: docker/camoufox-launcher.Dockerfile
+    ports:
+      - "8888:8888"
+    environment:
+      CAMOUFOX_HTTP_BIND: "0.0.0.0"
+      CAMOUFOX_WS_HOST: camoufox-launcher
+      TZ: Europe/Moscow
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+  notification:
+    image: rg.gdev.by/alert-job/notification-alert-job:$alert_job_version
+    ports:
+      - "8019:8019"
+    environment:
+       - "SPRING_PROFILES_ACTIVE=$profile"
+       - TZ=Europe/Moscow
+       - CAMOUFOX_LAUNCHER_URL=http://camoufox-launcher:8888
+    env_file:
+      - .env
+    depends_on:
+      camoufox-launcher:
+        condition: service_healthy
+      config:
+        condition: service_healthy
+      core:
+        condition: service_healthy
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8019/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+  llm:
+    image: rg.gdev.by/alert-job/llm-alert-job:$alert_job_version
+    ports:
+      - "8033:8033"
+    env_file:
+      - .env
+    environment:
+       - "SPRING_PROFILES_ACTIVE=$profile"
+       - TZ=Europe/Moscow
+    depends_on:
+      config:
+        condition: service_healthy
+      core:
+        condition: service_healthy
+      notification:
+        condition: service_healthy
+  parser:
+    image: rg.gdev.by/alert-job/parser-alert-job:$alert_job_version
+    ports:
+      - "8017:8017"
+    env_file:
+      - .env
+    environment:
+       - "SPRING_PROFILES_ACTIVE=dev"
+       - TZ=Europe/Moscow
+    depends_on:
+      config:
+        condition: service_healthy
+  core:
+    image: rg.gdev.by/alert-job/core-alert-job:$alert_job_version
+    ports:
+      - "8018:8018"
+    environment:
+       - "SPRING_PROFILES_ACTIVE=$profile"
+       - TZ=Europe/Moscow
+    env_file:
+      - .env
+    depends_on:
+      config:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8018/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus:latest
+    volumes:
+      - ../alert-job-base/config/prometheus/:/etc/prometheus/
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    ports:
+      - 9090:9090
+  grafana:
+    container_name: grafana 
+    image: "grafana/grafana:latest"
+    ports:
+      - "3000:3000"
+    volumes:
+    - grafana-volume:/var/lib/grafana
+  front:
+    image: rg.gdev.by/alert-job/front:1.0
+    environment:
+      VIRTUAL_HOST: alertjob.by
+      VIRTUAL_PATH: /front
+      TZ: Europe/Moscow
+    mem_limit: 256m
+volumes:
+  grafana-volume: {}  
+networks:
+  alert-job:
+    driver: bridge      
+      

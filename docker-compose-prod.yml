@@ -1,0 +1,310 @@
+services:
+  nginx-proxy:
+    restart: always
+    container_name: nginx-proxy
+    image: nginxproxy/nginx-proxy
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - html:/usr/share/nginx/html
+      - ../alert-job-base/config/vhost-nginx:/etc/nginx/vhost.d
+      - certs:/etc/nginx/certs:ro
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ../alert-job-base/config/nginx-conf-d:/etc/nginx/conf.d
+    environment:
+      TZ: Europe/Moscow
+      HTTPS_METHOD: noredirect
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:80/ | grep -q nginx || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+  nginx-proxy-acme:
+    restart: always
+    image: nginxproxy/acme-companion
+    volumes:
+      - certs:/etc/nginx/certs:rw
+      - ../alert-job-base/config/vhost-nginx:/etc/nginx/vhost.d
+      - html:/usr/share/nginx/html
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acme:/etc/acme.sh
+    environment:
+      DEFAULT_EMAIL: $acme_email
+      NGINX_PROXY_CONTAINER: nginx-proxy
+      TZ: Europe/Moscow
+      HTTPS_METHOD: noredirect
+    #  - HTTPS_METHOD=redirect
+    depends_on:
+      nginx-proxy:
+       condition: service_healthy
+  db:
+    restart: always
+    image: mariadb:11.1.2-jammy
+    volumes:
+      - database-volume:/var/lib/mysql
+      - ../alert-job-base/config/database:/docker-entrypoint-initdb.d
+    environment:
+      - MYSQL_ROOT_PASSWORD=$database_user_password
+      - MYSQL_USER=$database_user
+      - MYSQL_PASSWORD=$database_user_password
+      - TZ=Europe/Moscow
+  keycloak:
+    restart: always
+    image: quay.io/keycloak/keycloak
+    command:
+      - "start"
+      - "--hostname-url=https://$domain/keycloak"
+      - "--hostname-admin-url=https://$domain/keycloak"
+      - "--db mariadb"
+      - "--db-url-host db"
+      - "--db-username $database_user"
+      - "--db-password $database_user_password"
+      #- health-enabled=true
+      #- metrics-enabled=true
+    environment:
+      VIRTUAL_HOST: $domain
+      VIRTUAL_PORT: 8080
+      VIRTUAL_PATH: /keycloak
+      LETSENCRYPT_HOST: $domain
+      LETSENCRYPT_EMAIL: $acme_email
+#      KC_HOSTNAME_STRICT_HTTPS: false
+      KC_HTTP_ENABLED: true
+      KC_PROXY: edge
+      KEYCLOAK_ADMIN: $keycloak_admin
+      KEYCLOAK_ADMIN_PASSWORD: $keycloak_admin_password
+      KEYCLOAK_USER: $keycloak_admin
+      KEYCLOAK_PASSWORD: $keycloak_admin_password
+      TZ: Europe/Moscow
+    depends_on:
+      - db
+    mem_limit: 612m
+  config:
+    restart: always
+    image: rg.gdev.by/alert-job/alert-job-config:$alert_job_version
+    env_file:
+      - .env
+    environment:
+      - "SPRING_PROFILES_ACTIVE=${profile}"
+      - TZ=Europe/Moscow
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8011/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    volumes:
+      - ../alert-job-base/config/loki:/etc/loki
+      - loki-data:/loki
+    command: -config.file=/etc/loki/loki-config.yaml
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    restart: unless-stopped
+    volumes:
+      - ../alert-job-base/config/promtail:/etc/promtail
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro  # Логи контейнеров
+      - /var/log:/var/log:ro  # Системные логи
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Сокет Docker
+    command: -config.file=/etc/promtail/promtail-config.yaml
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  front:
+    restart: always
+    image: rg.gdev.by/alert-job/front:$alert_job_version
+    environment:
+      VIRTUAL_HOST: $domain
+      VIRTUAL_PATH: /front
+      TZ: Europe/Moscow
+    mem_limit: 256m
+  gateway:
+    restart: always
+    image: rg.gdev.by/alert-job/alert-job-gateway:$alert_job_version
+    environment:
+      VIRTUAL_HOST: $domain
+      VIRTUAL_PATH: /
+      VIRTUAL_PORT: 8015
+      SPRING_PROFILES_ACTIVE: $profile
+      TZ: Europe/Moscow
+    env_file:
+      - .env
+    depends_on:
+      config:
+        condition: service_healthy
+    mem_limit: 512m
+  camoufox-launcher:
+    restart: always
+    image: rg.gdev.by/alert-job/camoufox-launcher:$alert_job_version
+    environment:
+      CAMOUFOX_HTTP_BIND: "0.0.0.0"
+      CAMOUFOX_WS_HOST: camoufox-launcher
+      TZ: Europe/Moscow
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8888/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+  notification:
+    restart: always
+    image: rg.gdev.by/alert-job/notification-alert-job:$alert_job_version
+    env_file:
+      - .env
+    environment:
+       - SPRING_PROFILES_ACTIVE=prod
+       - TZ=Europe/Moscow
+    depends_on:
+      camoufox-launcher:
+        condition: service_healthy
+      config:
+        condition: service_healthy
+      core:
+        condition: service_healthy
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8019/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    volumes:
+      - "./tmp_images:/app/autoreply/screenshots"
+  parser:
+    restart: always
+    image: rg.gdev.by/alert-job/parser-alert-job:$alert_job_version
+    env_file:
+      - .env
+    environment:
+       - "SPRING_PROFILES_ACTIVE=$profile"
+       - TZ=Europe/Moscow
+    volumes:
+       - "$parser_config_directory:/etc/parser/config"
+    depends_on:
+      config:
+        condition: service_healthy
+      db:
+        condition: service_started
+    mem_limit: 10g
+  core:
+    restart: always
+    image: rg.gdev.by/alert-job/core-alert-job:$alert_job_version
+    environment:
+       - "SPRING_PROFILES_ACTIVE=prod"
+       - TZ=Europe/Moscow
+    env_file:
+      - .env
+    depends_on:
+      config:
+        condition: service_healthy
+      db:
+        condition: service_started
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8018/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+  llm:
+    restart: always
+    image: rg.gdev.by/alert-job/llm-alert-job:$alert_job_version
+    env_file:
+      - .env
+    environment:
+       - "SPRING_PROFILES_ACTIVE=$profile"
+       - TZ=Europe/Moscow
+    depends_on:
+      config:
+        condition: service_healthy
+      core:
+        condition: service_healthy
+      notification:
+        condition: service_healthy
+  prometheus:
+    restart: always
+    container_name: prometheus
+    image: prom/prometheus:latest
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    volumes:
+      - $prometheus_directory/:/etc/prometheus/
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    environment:
+      TZ: Europe/Moscow
+  grafana:
+    restart: always
+    container_name: grafana
+    image: "grafana/grafana:latest"
+    volumes:
+    - grafana-volume:/var/lib/grafana
+    environment:
+      VIRTUAL_HOST: $grafana_domain
+      LETSENCRYPT_EMAIL: $acme_email
+      LETSENCRYPT_HOST: $grafana_domain
+      VIRTUAL_PORT: 3000
+      GF_SERVER_ROOT_URL: "https://$grafana_domain"
+      GF_SERVER_DOMAIN: $grafana_domain
+      TZ: Europe/Moscow
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+  adminer:
+    image: adminer
+    restart: always
+    environment:
+      VIRTUAL_HOST: $domain
+      VIRTUAL_PORT: 8080
+      VIRTUAL_PATH: /db
+  # blackbox_exporter:
+  #   image: prom/blackbox-exporter
+  #   container_name: blackbox
+  #   restart: always
+
+volumes:
+  database-volume: {}
+  grafana-volume: {}
+  certs: {}
+  vhost: {}
+  html: {}
+  nginx-conf-d: {}
+  acme: {}
+  loki-data: {}
+networks:
+  alert-job:
+    driver: bridge

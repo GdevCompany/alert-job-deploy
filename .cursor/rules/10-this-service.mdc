@@ -1,0 +1,8 @@
+---
+description: Repositoriy alert-job-deploy
+alwaysApply: true
+---
+
+# alert-job-deploy
+
+Dockerfiles in `docker/`, compose files, CI templates. Dev Keycloak image: `keycloak/` (realm import baked in). Java services build from sibling repos; images reference `rg.gdev.by`.
